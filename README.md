@@ -12,4 +12,4 @@
 
 5. python eda/analysis.py
 
-6. Charts will be created in eda/plots/.
+6. Charts will be created in eda/plots/
