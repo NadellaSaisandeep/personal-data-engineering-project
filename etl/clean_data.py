@@ -1,111 +1,95 @@
-# etl/clean_data.py (fixed, debug-friendly)
+
 import os
 import pandas as pd
 import numpy as np
 import re
+import logging
 
-RAW_PATH = "data/raw/synthetic_products.csv"
-OUT_DIR = "data/extracted"
-OUT_PATH = os.path.join(OUT_DIR, "cleaned_products.csv")
-os.makedirs(OUT_DIR, exist_ok=True)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-print("DEBUG: Starting ETL")
-print("DEBUG: Raw path exists?", os.path.exists(RAW_PATH))
-if os.path.exists(RAW_PATH):
-    print("DEBUG: Raw file size (bytes):", os.path.getsize(RAW_PATH))
+RAW_DIR = "data/raw"
+OUTPUT_DIR = "data/extracted"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def parse_price(price_raw):
-    if pd.isna(price_raw):
+def parse_price(price):
+    """Extract numeric value from price text (e.g., '₹500 / piece', '$20', '1,000-2,000')."""
+    if pd.isna(price):
         return np.nan
-    s = str(price_raw)
-    nums = re.findall(r"[\d,]+", s)
-    if not nums:
+    text = str(price).replace(",", "").strip()
+    match = re.findall(r"[\d.]+", text)
+    if not match:
         return np.nan
-    n = nums[0].replace(",", "")
-    try:
-        return float(n)
-    except:
-        return np.nan
+    nums = [float(x) for x in match]
+    return np.mean(nums) if len(nums) > 1 else nums[0]
 
-def normalize_text(s):
-    if pd.isna(s):
-        return s
-    return str(s).strip()
+def clean_text(x):
+    """Basic text cleaner."""
+    if pd.isna(x):
+        return ""
+    return re.sub(r"\s+", " ", str(x)).strip()
+
+def detect_latest_file():
+    """Find the most relevant raw CSV automatically."""
+    csv_files = [os.path.join(RAW_DIR, f) for f in os.listdir(RAW_DIR) if f.endswith(".csv")]
+    if not csv_files:
+        raise FileNotFoundError("No raw CSV files found in data/raw/")
+    latest = max(csv_files, key=os.path.getmtime)
+    logging.info(f"Using latest raw file: {os.path.basename(latest)}")
+    return latest
+
 
 def main():
-    print("DEBUG: About to read CSV")
-    try:
-        df = pd.read_csv(RAW_PATH)
-    except Exception as e:
-        print("ERROR reading CSV:", repr(e))
-        return
+    logging.info("Starting ETL pipeline...")
 
-    print("Loaded rows:", len(df))
-    print("Columns:", list(df.columns)[:50])
+    raw_file = detect_latest_file()
+    df = pd.read_csv(raw_file, low_memory=False)
+    logging.info(f"Loaded {len(df)} rows and {len(df.columns)} columns.")
 
-    # Normalize text fields
-    df['title'] = df.get('title', pd.Series(dtype=str)).apply(normalize_text)
-    df['supplier_name'] = df.get('supplier_name', pd.Series(dtype=str)).apply(normalize_text)
-    df['location'] = df.get('location', pd.Series(dtype=str)).apply(normalize_text)
+  
+    df.columns = [c.lower().strip().replace(" ", "_") for c in df.columns]
 
-    # Parse numeric fields robustly
-    df['price_numeric'] = df.get('price_raw', pd.Series()).apply(parse_price)
-    # Ensure moq is numeric
-    if 'moq' in df.columns:
-        df['moq'] = pd.to_numeric(df['moq'], errors='coerce').fillna(1).astype(int)
-    else:
-        df['moq'] = 1
+ 
+    rename_map = {
+        "title": "product_name",
+        "supplier_name": "supplier",
+        "company": "supplier",
+        "price": "price_raw",
+        "price_value": "price_raw",
+        "price_text": "price_raw",
+        "location": "location",
+        "category": "category",
+        "product_url": "product_url",
+    }
+    df = df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
 
-    # Drop rows without title (essential)
+   
+    for col in ["product_name", "supplier", "price_raw", "location", "category"]:
+        if col not in df.columns:
+            df[col] = ""
+
+   
+    for col in ["product_name", "supplier", "location", "category"]:
+        df[col] = df[col].astype(str).apply(clean_text)
+
+ 
+    df["price_numeric"] = df["price_raw"].apply(parse_price)
+
+    
     before = len(df)
-    df = df[df['title'].notna() & (df['title'] != "")]
-    after_drop = len(df)
-    print(f"Dropped {before-after_drop} rows without title")
+    df = df.drop_duplicates(subset=["product_name", "supplier"])
+    df = df[df["product_name"].str.strip() != ""]
+    logging.info(f"Dropped {before - len(df)} duplicates or empty rows.")
 
-    # Deduplicate by title + supplier_name
-    before = len(df)
-    df = df.drop_duplicates(subset=['title','supplier_name'])
-    after = len(df)
-    print(f"Dropped {before-after} duplicate rows")
+    
+    if "price_numeric" in df:
+        p99 = df["price_numeric"].quantile(0.99)
+        df.loc[df["price_numeric"] > p99, "price_numeric"] = np.nan
 
-    # Fill missing price_numeric with group median using transform (preserves index)
-    # First, ensure price_numeric is float dtype
-    df['price_numeric'] = pd.to_numeric(df['price_numeric'], errors='coerce')
-
-    # Compute group medians and fillna using transform
-    try:
-        medians = df.groupby('category')['price_numeric'].transform('median')
-        df['price_numeric'] = df['price_numeric'].fillna(medians)
-    except Exception as e:
-        print("WARNING: group median fill failed:", repr(e))
-        # fallback: fill with global median
-        global_median = df['price_numeric'].median()
-        df['price_numeric'] = df['price_numeric'].fillna(global_median)
-
-    # Compute price per moq safely
-    df['price_per_moq'] = df['price_numeric'] / df['moq'].replace(0,1)
-
-    # Remove extreme outliers per category using z-score (4 sigma)
-    def remove_outliers(group):
-        vals = group['price_numeric'].astype(float)
-        mean = vals.mean()
-        std = vals.std(ddof=0) if vals.std(ddof=0) > 0 else 1.0
-        mask = (np.abs((vals - mean) / std) < 4)
-        return group[mask]
-
-    try:
-        df = df.groupby('category', group_keys=False).apply(remove_outliers)
-    except Exception as e:
-        print("WARNING: outlier removal failed:", repr(e))
-
-    # Final sanity: reset index and write CSV
-    df = df.reset_index(drop=True)
-    try:
-        df.to_csv(OUT_PATH, index=False)
-        print("Saved cleaned data to", OUT_PATH)
-        print("Final rows:", len(df))
-    except Exception as e:
-        print("ERROR writing CSV:", repr(e))
+  
+    out_file = os.path.join(OUTPUT_DIR, "cleaned_real_combined_products.csv")
+    df.to_csv(out_file, index=False)
+    logging.info(f" Cleaned data saved to {out_file}")
+    logging.info(f"Final shape: {df.shape}")
 
 if __name__ == "__main__":
     main()
